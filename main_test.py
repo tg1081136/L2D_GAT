@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from models_GAT.graphgat import GraphGAT
 from models_GAT.mlp_GAT import MultiLayerPerceptron
-from models_GAT.actor_critic_GAT_redefine import ActorCritic  # 假設你已經封裝這個類別
+from models_GAT.actor_critic_GAT_redefine_copy import ActorCritic  # 假設你已經封裝這個類別
 from uniform_instance_gen import uni_instance_gen
 
 # ✅ 環境參數

@@ -1,3 +1,4 @@
+import ipdb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,62 +13,70 @@ class ActorCritic(nn.Module):
         self.n_j = n_j
         self.n_m = n_m
         self.device = device
-
+        
         self.gnn = GraphGAT(node_input_dim, graph_hidden_dim, graph_output_dim,
                            num_layers=num_layers, heads=heads).to(device)
 
         self.actor_mlp = None  # 延遲初始化
         self.critic_mlp = MultiLayerPerceptron(graph_output_dim, self.mlp_hidden_dim,
                                               1, num_layers=3, activation='tanh', norm_type='layernorm').to(device)
+        
+        
+    def forward(self, x, edge_index, graph_pool, omega, mask):
+        # ===== 1. GNN encoder =====
+        h_pooled, h_nodes = self.gnn(x, edge_index, graph_pool)  # [n_jobs * n_machines, dim] / [n_jobs, dim]
 
-    def forward(self, x, edge_index, graph_pool, candidate, mask):
-        h_pooled, h_nodes = self.gnn(x, edge_index, graph_pool)
-        #print(f"h_pooled shape: {h_pooled.shape}, values: {h_pooled}, any NaN: {torch.isnan(h_pooled).any()}")
-        #print(f"h_nodes shape: {h_nodes.shape}, values: {h_nodes}, any NaN: {torch.isnan(h_nodes).any()}")
+        # ===== 2. Critic =====
+        h_global = torch.mean(h_pooled, dim=0, keepdim=True)  # [1, dim]
+        v = self.critic_mlp(h_global).squeeze(-1)  # scalar state value
 
-        # 抽取 candidate node feature
-        candidate_feature = h_nodes[candidate]  # [n_candidates, graph_output_dim]
-        #print(f"candidate_feature shape: {candidate_feature.shape}, values: {candidate_feature}, any NaN: {torch.isnan(candidate_feature).any()}")
+        # ===== 3. 靜態 candidate 構建 =====
+        n_j = self.n_j
+        n_m = self.n_m
+        device = x.device
 
-        # 對應的 job index 決定用哪個 pooled 向量
-        job_indices = (candidate // self.n_m)
-        h_pooled_selected = h_pooled[job_indices]  # [n_candidates, graph_output_dim]
-        #print(f"h_pooled_selected shape: {h_pooled_selected.shape}, values: {h_pooled_selected}, any NaN: {torch.isnan(h_pooled_selected).any()}")
+        candidate = torch.arange(n_j, device=device)  # [0, 1, ..., n_j - 1]
+        omega_tensor = omega.to(device)               # shape: [n_j]
 
-        # 合併兩個來源的特徵
-        concat_fea = torch.cat((candidate_feature, h_pooled_selected), dim=-1)  # [n_candidates, 2 * graph_output_dim]
-        #print(f"concat_fea shape: {concat_fea.shape}, values: {concat_fea}, any NaN: {torch.isnan(concat_fea).any()}")
+        # ===== 🛡️ sanity check before indexing =====
+        if omega_tensor.shape[0] != n_j:
+            raise ValueError(f"[ERROR] omega 長度錯誤: {omega_tensor.shape[0]} ≠ {n_j}")
 
-        # 延遲初始化 actor_mlp
+        if not torch.all((0 <= omega_tensor) & (omega_tensor < n_m)):
+            overflow_jobs = torch.where(omega_tensor >= n_m)[0].tolist()
+            raise ValueError(f"[ERROR] 以下 job 的 omega 超過 machine 數 n_m={n_m} ➜ job_ids={overflow_jobs}")
+
+        node_idx = candidate * n_m + omega_tensor  # [n_j]
+
+        # ===== 4. 建立 actor 輸入 =====
+        candidate_feature = h_nodes[node_idx]            # [n_j, dim]
+        h_pooled_selected = h_pooled[candidate]          # [n_j, dim]
+        concat_fea = torch.cat((candidate_feature, h_pooled_selected), dim=-1)  # [n_j, 2*dim]
+
         if self.actor_mlp is None:
-            input_dim = concat_fea.size(-1)
-            self.actor_mlp = MultiLayerPerceptron(input_dim, self.mlp_hidden_dim,
-                                                 1, num_layers=3, activation='tanh', norm_type='layernorm').to(self.device)
-            # 檢查權重（若支援）
-            try:
-                if hasattr(self.actor_mlp, 'weight') and torch.isnan(self.actor_mlp.weight).any():
-                    print("NaN detected in actor_mlp weights")
-            except AttributeError:
-                print("actor_mlp has no weight attribute, skipping check")
+            self.actor_mlp = MultiLayerPerceptron(
+                input_dim=concat_fea.size(-1),
+                hidden_dim=self.mlp_hidden_dim,
+                output_dim=1,
+                num_layers=3,
+                activation='tanh',
+                norm_type='layernorm'
+            ).to(device)
 
-        candidate_scores = self.actor_mlp(concat_fea).squeeze(-1)
-        #print(f"candidate_scores shape: {candidate_scores.shape}, values: {candidate_scores}, any NaN: {torch.isnan(candidate_scores).any()}")
-        #print(f"candidate_scores min: {candidate_scores.min()}, max: {candidate_scores.max()}")
+        candidate_scores = self.actor_mlp(concat_fea).squeeze(-1)  # [n_j]
+        candidate_scores = torch.clamp(candidate_scores, min=-10, max=10)
 
-        #if mask.all():
-            #print("⚠️ Warning: all candidates are masked out.")
-
+        # ===== 5. 採用 job-level mask =====
         if mask is not None:
-            candidate_scores = candidate_scores.masked_fill(mask, float('-inf'))
-            #print(f"candidate_scores after mask shape: {candidate_scores.shape}, values: {candidate_scores}, any NaN: {torch.isnan(candidate_scores).any()}")
-
-        if torch.isinf(candidate_scores).all() or torch.isnan(candidate_scores).any():
-            pi = torch.ones_like(candidate_scores).squeeze(-1)
-            pi = pi / pi.sum(dim = -1, keepdim=True) 
+            if not mask.any():
+                raise ValueError("No valid jobs available in mask")
+            elif mask.sum() == 1:
+                pi = torch.zeros_like(candidate_scores)
+                pi[mask] = 1.0
+            else:
+                candidate_scores = candidate_scores.masked_fill(~mask, float('-inf'))
+                pi = F.softmax(candidate_scores, dim=-1)
         else:
-            pi = F.softmax(candidate_scores, dim = -1)
-        #print(f"🎯 pi shape: {pi.shape}, values: {pi}, sum: {pi.sum()}")
+            pi = F.softmax(candidate_scores, dim=-1)
 
-        v = self.critic_mlp(h_pooled).squeeze(-1)  # [n_j]
-        #print(f"v shape: {v.shape}, values: {v}, any NaN: {torch.isnan(v).any()}")
-        return pi, v
+        return pi.unsqueeze(0), v

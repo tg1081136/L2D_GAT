@@ -21,14 +21,19 @@ class GraphGAT(nn.Module):
         self.convs.append(GATConv(hidden_dim * heads, output_dim, heads=1, concat=False))
     
     def forward(self, x, edge_index, graph_pool):
+        #print(f"[GNN Input] edge_index.shape: {edge_index.shape}, dtype: {edge_index.dtype}")
+        assert isinstance(edge_index, torch.Tensor), "edge_index is not a Tensor!"
+        assert edge_index.dtype in (torch.int64, torch.int32), f"edge_index has wrong dtype: {edge_index.dtype}"
+        assert edge_index.dim() == 2 and edge_index.shape[0] == 2, f"edge_index shape wrong: {edge_index.shape}"
+
         for conv, bn in zip(self.convs[:-1], self.bns):
             x = conv(x, edge_index)
             x = bn(x)
             x = F.relu(x)
         h_nodes = self.convs[-1](x, edge_index)
 
-        #print(f"h_nodes shape: {h_nodes.shape}")
-        #print(f"graph_pool shape: {graph_pool.shape}")
+        #print(f"GAT h_nodes shape: {h_nodes.shape}")
+        #print(f"GAT graph_pool shape: {graph_pool.shape}")
         assert h_nodes.shape[0] == graph_pool.shape[1], f"Graph node count mismatch: h_nodes={h_nodes.shape[0]}, expected={graph_pool.shape[1]}"
 
         h_pooled = torch.sparse.mm(graph_pool, h_nodes) if graph_pool is not None else h_nodes[:self.n_j]  # Fallback to first n_j nodes

@@ -1,7 +1,7 @@
 from mb_agg import *
 from agent_utils import eval_actions
-from agent_utils import select_action
-from models_GAT.actor_critic_GAT_redefine_copy import ActorCritic
+from agent_utils import select_action_dy
+from models_GAT.actor_critic_GAT_dynamic import ActorCritic
 from copy import deepcopy
 import ipdb
 import torch
@@ -25,7 +25,7 @@ class Memory:
     def __init__(self):
         self.adj_mb = []
         self.fea_mb = []
-        self.omega_mb = []
+        self.candidate_mb = []
         self.mask_mb = []
         self.a_mb = []
         self.r_mb = []
@@ -35,7 +35,7 @@ class Memory:
     def clear_memory(self):
         del self.adj_mb[:]
         del self.fea_mb[:]
-        del self.omega_mb[:]
+        del self.candidate_mb[:]
         del self.mask_mb[:]
         del self.a_mb[:]
         del self.r_mb[:]
@@ -73,15 +73,12 @@ class PPO:
                                   heads=heads,
                                   device=device)
         with torch.no_grad():
-            n_nodes = n_j * n_m
-            dummy_fea = torch.zeros(n_nodes, node_input_dim).to(device)
-            dummy_edge = torch.randint(0, n_nodes, (2, 10), dtype=torch.long).to(device)  # 隨便造一組合理邊
-            dummy_pool = torch.eye(n_j).repeat(1, int(n_nodes / n_j)).to(device)[:n_j]    # 每個 job 對應 pool
-
-            dummy_omega = torch.zeros(n_j, dtype=torch.long).to(device)                   # 每個 job 初始 op = 0
-            dummy_mask = torch.ones(n_j, dtype=torch.bool).to(device)                     # 全部合法 job
-
-            self.policy(dummy_fea, dummy_edge, dummy_pool, dummy_omega, dummy_mask)
+            dummy_fea = torch.randn(5, node_input_dim).to(device)
+            dummy_edge = torch.tensor([[0, 1], [1, 0]], dtype=torch.long).to(device)
+            dummy_pool = torch.eye(1, 5).to(device)
+            dummy_candidate = torch.tensor([0], dtype=torch.long).to(device)
+            dummy_mask = torch.tensor([True]).to(device)
+            self.policy(dummy_fea, dummy_edge, dummy_pool, dummy_candidate, dummy_mask)
 
         self.policy_old = deepcopy(self.policy)
         self.policy_old.load_state_dict(self.policy.state_dict())
@@ -99,8 +96,7 @@ class PPO:
         rewards_all_env = []
         edge_index_mb_t_all_env = []
         fea_mb_t_all_env = []
-        #candidate_mb_t_all_env = []
-        omega_mb_t_all_env = []
+        candidate_mb_t_all_env = []
         mask_mb_t_all_env = []
         a_mb_t_all_env = []
         old_logprobs_mb_t_all_env = []
@@ -117,13 +113,11 @@ class PPO:
             rewards_all_env.append(rewards)
 
             edge_index_mb_t = memories[i].adj_mb
-            
             edge_index_mb_t_all_env.append(edge_index_mb_t)
 
             fea_mb_t = torch.stack(memories[i].fea_mb).to(device)
             fea_mb_t_all_env.append(fea_mb_t)
-            omega_mb_t_all_env.append(torch.stack(memories[i].omega_mb).to(device))  
-            #candidate_mb_t_all_env.append(torch.stack(memories[i].candidate_mb).to(device).squeeze())
+            candidate_mb_t_all_env.append(torch.stack(memories[i].candidate_mb).to(device).squeeze())
             mask_mb_t_all_env.append(torch.stack(memories[i].mask_mb).to(device).squeeze())
             a_mb_t_all_env.append(torch.stack(memories[i].a_mb).to(device).squeeze())
             old_logprobs_mb_t_all_env.append(torch.stack(memories[i].logprobs).to(device).squeeze().detach())
@@ -132,7 +126,6 @@ class PPO:
                                batch_size=None,
                                n_nodes=configs.n_j * configs.n_m,
                                device=device)
-        
         for _ in range(self.k_epochs):
             loss_sum = 0
             vloss_sum = 0
@@ -147,14 +140,12 @@ class PPO:
                     assert isinstance(x, torch.Tensor), f"x is not a tensor: {type(x)}"
                     assert x.dim() == 2, f"x dimension error: {x.shape}"
                     
-                    omega = omega_mb_t_all_env[i][t].clone().to(device)
-
                     try:
                         pis, vals = self.policy(
                             x=x,
                             edge_index=edge_index_mb_t_all_env[i][t],
                             graph_pool=mb_g_pool,
-                            omega=omega,
+                            candidate=candidate_mb_t_all_env[i][t],
                             mask=mask_mb_t_all_env[i][t]
                         )
                         #print(f"[DEBUG] t={t}, pis.shape: {pis.shape}, vals.shape: {vals.shape}, vals: {vals}")
@@ -184,7 +175,7 @@ class PPO:
                     probs = pis[t]
                     action = a_mb_t_all_env[i][t]
                     mask = mask_mb_t_all_env[i][t]
-                    #candidate = candidate_mb_t_all_env[i][t]
+                    candidate = candidate_mb_t_all_env[i][t]
                     #print(f"[DEBUG] t={t}, probs: {probs}, action: {action}, mask: {mask}, candidate: {candidate}")
                     
                     valid_indices = torch.where(mask)[0]
@@ -258,13 +249,12 @@ def main():
         t_step = 0
         edge_index_envs = []
         fea_envs = []
-        omega_envs = []
-        #candidate_envs = []
+        candidate_envs = []
         mask_envs = []
 
         for i, env in enumerate(envs):
             state, info = env.reset(data_generator(n_j=configs.n_j, n_m=configs.n_m, low=configs.low, high=configs.high))
-            edge_index, fea, omega, mask = state
+            edge_index, fea, candidate, mask = state
             #print(f"[DEBUG] env={i} reset: candidate={candidate}, mask={mask}, done={env.done()}")
             if env.done():
                 print(f"[ERROR] env={i} done after reset")
@@ -272,55 +262,58 @@ def main():
             if not np.any(mask):
                 print(f"[ERROR] No valid candidates in reset mask for env {i}, candidate={candidate}, mask={mask}")
                 ipdb.set_trace()
-
-            '''
             if len(mask) != len(candidate):
                 print(f"[ERROR] Mismatch: mask length={len(mask)}, candidate length={len(candidate)}")
                 ipdb.set_trace()
-            '''
 
             edge_index_envs.append(edge_index)
             fea_envs.append(fea)
-            omega_envs.append(omega)
-            #candidate_envs.append(candidate)
+            candidate_envs.append(candidate)
             mask_envs.append(mask)
             ep_rewards[i] = -env.initQuality
 
         # rollout the env
         while True:
             t_step += 1
-            #print(f"[INFO] Time step: {t_step}")
             
+            # 檢查是否所有環境都已完成
+            if all(env.done() for env in envs):
+                #print(f"[INFO] All environments done, stopping at step {t_step}")
+                break
+            
+            # 過濾出未完成的環境
+            active_envs = [i for i in range(configs.num_envs) if not envs[i].done()]
+            
+            if not active_envs:
+                print(f"[INFO] No active environments, stopping at step {t_step}")
+                break
+            
+            # 為活躍的環境準備張量
             fea_tensor_envs = [torch.tensor(fea, device=device, dtype=torch.float32) if isinstance(fea, np.ndarray) else fea.to(device) for fea in fea_envs]
             edge_index_envs = [edge_index.to(device) for edge_index in edge_index_envs]
-            omega_tensor_envs = [torch.tensor(omega, dtype=torch.long, device=device) for omega in omega_envs]
-            mask_tensor_envs = [torch.tensor(mask, dtype=torch.bool, device=device) for mask in mask_envs]
-            #candidate_tensor_envs = [torch.tensor(candidate, device=device, dtype=torch.int64) for candidate in candidate_envs]
-        
-
+            candidate_tensor_envs = [torch.tensor(candidate, device=device, dtype=torch.int64) for candidate in candidate_envs]
+            mask_tensor_envs = [torch.tensor(mask, device=device, dtype=torch.bool) for mask in mask_envs]
+            
             with torch.no_grad():
                 action_envs = []
                 a_idx_envs = []
+                
                 for i in range(configs.num_envs):
                     if envs[i].done():
-                        print(f"[WARNING] env={i} is done, skipping")
+                        # 對於已完成的環境，添加佔位符
+                        action_envs.append(None)
+                        a_idx_envs.append(None)
                         continue
                     
                     if not mask_tensor_envs[i].any():
-                        print(f"[ERROR] No valid candidates in mask for env {i}, omega={omega_envs[i]}, mask={mask_tensor_envs[i]}")
+                        print(f"[ERROR] No valid candidates in mask for env {i}, candidate={candidate_envs[i]}, mask={mask_tensor_envs[i]}")
                         ipdb.set_trace()
-
-                    for j in range(len(omega_envs[i])):
-                        if omega_envs[i][j] >= configs.n_m:
-                            mask_envs[i][j] = False  # 🛡️ 更新原始 mask
-                    mask_tensor_envs[i] = torch.tensor(mask_envs[i], dtype=torch.bool, device=device)  # 🆕 重建 tensor
                     
                     pi, _ = ppo.policy_old(
                         x=fea_tensor_envs[i],
                         edge_index=edge_index_envs[i],
                         graph_pool=g_pool_step,
-                        omega=omega_tensor_envs[i],
-                        #candidate=candidate_tensor_envs[i],
+                        candidate=candidate_tensor_envs[i],
                         mask=mask_tensor_envs[i]
                     )
 
@@ -329,95 +322,67 @@ def main():
                     elif pi.dim() > 1:
                         pi = pi.squeeze(0)
 
-                    action, a_idx = select_action(
+                    action, a_idx = select_action_dy(
                         pi.squeeze(0),
-                        #torch.tensor(candidate_envs[i], dtype=torch.long, device=device),
+                        torch.tensor(candidate_envs[i], dtype=torch.long, device=device),
                         torch.tensor(mask_envs[i], dtype=torch.bool, device=device),
                         memories[i]
                     )
-                    print(f"[DEBUG] env={i}, pi: {pi.squeeze(0)}, omega: {omega_envs[i]}, mask: {mask_envs[i]}, action: {action}, a_idx: {a_idx}")
+                    #print(f"[DEBUG] env={i}, pi: {pi.squeeze(0)}, candidate: {candidate_envs[i]}, mask: {mask_envs[i]}, action: {action}, a_idx: {a_idx}")
                     
-                    valid_indices = np.where(mask_envs[i])[0]
-                    if len(valid_indices) == 0:
-                        #print(f"[ERROR] No valid candidates after select_action for env {i}")
-                        ipdb.set_trace()
-                    elif len(valid_indices) == 1 and a_idx != valid_indices[0]:
-                        #print(f"[ERROR] Invalid a_idx {a_idx}, expected {valid_indices[0]}")
-                        ipdb.set_trace()
-
-                    job_id = a_idx  # 選到的 job index
-
-                    if job_id >= configs.n_j or omega_envs[i][job_id] >= configs.n_m:
-                        print(f"[CRASH GUARD] job_id={job_id}, omega={omega_envs[i][job_id]} 超範圍")
-                        ipdb.set_trace()
-
-                    node_id = job_id * configs.n_m + omega_envs[i][job_id]  
-                    
-                    action_envs.append(node_id)
+                    action_envs.append(action)
                     a_idx_envs.append(a_idx)
             
+            # 先存儲當前狀態（執行動作前的狀態）到記憶中
+            for i in range(configs.num_envs):
+                if envs[i].done() or action_envs[i] is None:
+                    continue
+                    
+                # 存儲執行動作前的狀態
+                memories[i].adj_mb.append(edge_index_envs[i].clone().detach())
+                memories[i].fea_mb.append(fea_tensor_envs[i])
+                memories[i].mask_mb.append(mask_tensor_envs[i].clone().view(-1))
+                memories[i].candidate_mb.append(candidate_tensor_envs[i].clone().view(-1))
+                memories[i].a_mb.append(a_idx_envs[i].clone().detach().view(-1).to(device))
+            
+            # 然後執行動作並獲取獎勵
             new_edge_index_envs = []
             new_fea_envs = []
-            new_omega_envs = []
-            #new_candidate_envs = []
+            new_candidate_envs = []
             new_mask_envs = []
             
             for i in range(configs.num_envs):
-                if envs[i].done():
+                if envs[i].done() or action_envs[i] is None:
+                    # 對於已完成的環境，保持原狀態
+                    new_edge_index_envs.append(edge_index_envs[i] if i < len(edge_index_envs) else None)
+                    new_fea_envs.append(fea_envs[i] if i < len(fea_envs) else None)
+                    new_candidate_envs.append(candidate_envs[i] if i < len(candidate_envs) else None)
+                    new_mask_envs.append(mask_envs[i] if i < len(mask_envs) else None)
                     continue
+                    
                 edge_index, fea, reward, done, info = envs[i].step(action_envs[i].item())
                 candidate = info["omega"]
                 mask = info["mask"]
                 #print(f"[DEBUG] env={i}, step action: {action_envs[i]}, candidate: {candidate}, mask: {mask}, reward: {reward}, done: {done}")
                 
-                #candidate_tensor_envs[i] = torch.tensor(candidate, dtype=torch.long, device=device)
-                omega_tensor_envs = [torch.tensor(omega, dtype=torch.long, device=device) for omega in omega_envs]
-                mask_tensor_envs[i] = torch.tensor(mask, dtype=torch.bool, device=device)
-                
-                if not isinstance(candidate, (list, np.ndarray, torch.Tensor)):
-                    print(f"[ERROR] Invalid candidate type: {type(candidate)}")
-                    ipdb.set_trace()
-                if not isinstance(mask, (list, np.ndarray, torch.Tensor)):
-                    print(f"[ERROR] Invalid mask type: {type(mask)}")
-                    ipdb.set_trace()
-                if len(mask) != len(candidate):
-                    print(f"[ERROR] Mismatch: mask length={len(mask)}, candidate length={len(candidate)}")
-                    ipdb.set_trace()
-                if not done and not np.any(mask):
-                    print(f"[ERROR] No valid candidates in step mask for env {i}, candidate={candidate}, mask={mask}")
-                    ipdb.set_trace()
-                
-                assert isinstance(edge_index, torch.Tensor), f"edge_index type: {type(edge_index)}"
-                assert edge_index.dtype in (torch.int64, torch.int32), f"edge_index dtype: {edge_index.dtype}"
-                assert edge_index.shape[0] == 2, f"edge_index shape: {edge_index.shape}"
-                
-                memories[i].adj_mb.append(edge_index.clone().detach())
-                memories[i].fea_mb.append(fea_tensor_envs[i])
-
-                memories[i].mask_mb.append(mask_tensor_envs[i].clone().view(-1))
-                memories[i].omega_mb.append(torch.tensor(omega_envs[i], dtype=torch.long).clone().to(device))
-                #memories[i].candidate_mb.append(candidate_tensor_envs[i].clone().view(-1))
-
-                #print(f"動作張量形狀: {a_idx_envs[i].shape}, 值: {a_idx_envs[i]}")
-                memories[i].a_mb.append(a_idx_envs[i].clone().detach().view(-1).to(device))
+                # 存儲獎勵和完成狀態
                 memories[i].r_mb.append(reward)
                 memories[i].done_mb.append(done)
                 ep_rewards[i] += reward
                 
                 new_edge_index_envs.append(edge_index)
                 new_fea_envs.append(fea)
-                new_omega_envs.append(omega)
+                new_candidate_envs.append(candidate)
                 new_mask_envs.append(mask)
             
+            # 更新環境狀態
             edge_index_envs = new_edge_index_envs
             fea_envs = new_fea_envs
-            omega_envs = new_omega_envs
+            candidate_envs = new_candidate_envs
             mask_envs = new_mask_envs
             
-            if t_step >= max_steps or all(env.done() for env in envs):
-                #print(f"[INFO] Stopping after {t_step} steps")
-                #print(f"[DEBUG] Episode rewards: {ep_rewards}")
-                #print(f"[DEBUG] Memory length: {[len(m.r_mb) for m in memories]}")
+            if t_step >= max_steps:
+                #print(f"[INFO] Reached max steps ({max_steps}), stopping")
                 break
         
         for j in range(configs.num_envs):
@@ -470,7 +435,9 @@ def main():
                     str(configs.n_j) + '_' + str(configs.n_m) + '_' + str(configs.low) + '_' + str(configs.high)))
             with open('./vali_{}_{}_{}_{}.txt'.format(
                 configs.n_j, configs.n_m, configs.low, configs.high), 'w') as f:
-                f.write(str(vali_result)) 
+                f.write(str(vali_result))
+
+            t4 = time.time()
 
         t5 = time.time()
         # print('Training:', t4 - t3)

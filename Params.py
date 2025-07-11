@@ -4,8 +4,8 @@ parser = argparse.ArgumentParser(description='Arguments for ppo_jssp')
 # args for device
 parser.add_argument('--device', type=str, default="cuda", help='Device for training')
 # args for env
-parser.add_argument('--n_j', type=int, default=15, help='Number of jobs of instance')
-parser.add_argument('--n_m', type=int, default=15, help='Number of machines instance')
+parser.add_argument('--n_j', type=int, default=3, help='Number of jobs of instance')
+parser.add_argument('--n_m', type=int, default=3, help='Number of machines instance')
 parser.add_argument('--rewardscale', type=float, default=0., help='Reward scale for positive rewards')
 parser.add_argument('--init_quality_flag', type=bool, default=False, help='Flag of whether init state quality is 0, True for 0')
 parser.add_argument('--low', type=int, default=1, help='LB of duration')
@@ -27,8 +27,8 @@ parser.add_argument('--num_mlp_layers_actor', type=int, default=2, help='No. of 
 parser.add_argument('--num_mlp_layers_critic', type=int, default=2, help='No. of layers in critic MLP')
 parser.add_argument('--heads', type=int, default=1, help='Number of attention heads in GAT')
 # args for PPO
-parser.add_argument('--num_envs', type=int, default=4, help='No. of envs for training')
-parser.add_argument('--max_updates', type=int, default=10000, help='No. of episodes of each env for training')
+parser.add_argument('--num_envs', type=int, default=1, help='No. of envs for training')
+parser.add_argument('--max_updates', type=int, default=1000, help='No. of episodes of each env for training')
 parser.add_argument('--lr', type=float, default=2e-5, help='Learning rate')
 parser.add_argument('--decayflag', type=bool, default=False, help='Learning rate decay flag')
 parser.add_argument('--decay_step_size', type=int, default=2000, help='Decay step size')
@@ -39,5 +39,7 @@ parser.add_argument('--eps_clip', type=float, default=0.2, help='Clip parameter 
 parser.add_argument('--vloss_coef', type=float, default=1, help='Critic loss coefficient')
 parser.add_argument('--ploss_coef', type=float, default=2, help='Policy loss coefficient')
 parser.add_argument('--entloss_coef', type=float, default=0.01, help='Entropy loss coefficient')
+parser.add_argument('--max_steps', type=int, default=12, help='Set training_times')
+
 
 configs = parser.parse_args()

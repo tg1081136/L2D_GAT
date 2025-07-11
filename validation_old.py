@@ -24,68 +24,72 @@ def validate(vali_set, model):
     device = torch.device(configs.device)
     
     env = SJSSP(n_j=N_JOBS, n_m=N_MACHINES, device=device)
+    # 修正：將 batch_size 設為 None，與主程式一致
     g_pool_step = g_pool_cal(graph_pool_type=configs.graph_pool_type,
                              batch_size=None,
                              n_nodes=env.number_of_tasks,
                              device=device)
     make_spans = []
-
+    
     for data in vali_set:
-        try:
-            state, _ = env.reset(data)
-            adj, fea, candidate, mask = state
+        state, info = env.reset(data)
+        adj, fea, candidate, mask = state
+        rewards = -env.initQuality
+        print(f"[DEBUG] validate reset: candidate={candidate}, mask={mask}, done={env.done()}")
+        if env.done():
+            print(f"[ERROR] Environment done after reset")
+            ipdb.set_trace()
+        if not np.any(mask):
+            print(f"[ERROR] No valid candidates in reset mask, candidate={candidate}, mask={mask}")
+            ipdb.set_trace()
+        if len(mask) != len(candidate):
+            print(f"[ERROR] Mismatch: mask length={len(mask)}, candidate length={len(candidate)}")
+            ipdb.set_trace()
+        
+        while True:
+            adj_tensor = to_tensor(adj, dtype=torch.long, device=device)
+            fea_tensor = to_tensor(fea, dtype=torch.float32, device=device)
+            candidate_tensor = to_tensor(candidate, dtype=torch.long, device=device)
+            mask_tensor = to_tensor(mask, dtype=torch.bool, device=device)
+            print(f"[DEBUG] validate step: adj_tensor.shape={adj_tensor.shape}, fea_tensor.shape={fea_tensor.shape}, "
+                  f"candidate_tensor.shape={candidate_tensor.shape}, mask_tensor.shape={mask_tensor.shape}")
+            
+            with torch.no_grad():
+                pi, _ = model(
+                    x=fea_tensor,
+                    edge_index=adj_tensor,
+                    graph_pool=g_pool_step,
+                    candidate=candidate_tensor.unsqueeze(0),
+                    mask=mask_tensor.unsqueeze(0)
+                )
+                print(f"[DEBUG] validate step: pi.shape={pi.shape}, pi={pi}")
+            
+            action = greedy_select_action(pi, candidate)
+            print(f"[DEBUG] validate step: action={action}, candidate={candidate}, mask={mask}")
+            
+            adj, fea, reward, done, info = env.step(action.item())
+            candidate = info["omega"]
+            mask = info["mask"]
+            rewards += reward
+            print(f"[DEBUG] validate step: reward={reward}, done={done}, candidate={candidate}, mask={mask}")
 
-            if env.done() or not np.any(mask) or len(candidate) != len(mask):
-                print("[WARNING] Skipping invalid initial state.")
-                continue
-
-            rewards = -env.initQuality
-            step_count = 0
-            max_steps = env.number_of_tasks * 2
-            past_actions = set()
-
-            while True:
-                adj_tensor = to_tensor(adj, dtype=torch.long, device=device)
-                fea_tensor = to_tensor(fea, dtype=torch.float32, device=device)
-                candidate_tensor = to_tensor(candidate, dtype=torch.long, device=device)
-                mask_tensor = to_tensor(mask, dtype=torch.bool, device=device)
-
-                with torch.no_grad():
-                    pi, _ = model(
-                        x=fea_tensor,
-                        edge_index=adj_tensor,
-                        graph_pool=g_pool_step,
-                        candidate=candidate_tensor,
-                        mask=mask_tensor
-                    )
-
-                action = greedy_select_action(pi, candidate)
-
-                if action.item() in past_actions:
-                    print(f"[WARNING] Action {action.item()} repeated, likely stuck.")
-                    break
-                past_actions.add(action.item())
-
-                adj, fea, reward, done, info = env.step(action.item())
-                rewards += reward
-
-                candidate = info["omega"]
-                mask = info["mask"]
-
-                if not done and (not np.any(mask) or len(mask) != len(candidate)):
-                    print("[WARNING] Invalid mask/candidate during rollout. Skipping.")
-                    break
-
-                step_count += 1
-                if done or step_count >= max_steps:
-                    break
-
+            if env.done() or not np.any(mask) or len(mask) != len(candidate):
+                print(f"[WARNING] Skipping invalid validation sample")
+                continue  # 跳過這個 data
+            '''
+            if not done and not np.any(mask):
+                print(f"[ERROR] No valid candidates in step mask, candidate={candidate}, mask={mask}")
+                ipdb.set_trace()
+            if len(mask) != len(candidate):
+                print(f"[ERROR] Mismatch: mask length={len(mask)}, candidate length={len(candidate)}")
+                ipdb.set_trace()
+            
+            if done:
+                break
+                
+            '''
             make_spans.append(rewards - env.posRewards)
-
-        except Exception as e:
-            print(f"[ERROR] Validation failed on one instance: {e}")
-            continue  # Prevent entire run from crashing
-
+    
     return np.array(make_spans)
 
 if __name__ == '__main__':
@@ -100,7 +104,7 @@ if __name__ == '__main__':
     parser.add_argument('--Pn_j', type=int, default=2, help='Number of jobs of instances to test')
     parser.add_argument('--Pn_m', type=int, default=3, help='Number of machines instances to test')
     parser.add_argument('--Nn_j', type=int, default=2, help='Number of jobs on which to be loaded net are trained')
-    parser.add_argument('--Nn_m', type=int, default=13, help='Number of machines on which to be loaded net are trained')
+    parser.add_argument('--Nn_m', type=int, default=3, help='Number of machines on which to be loaded net are trained')
     parser.add_argument('--low', type=int, default=1, help='LB of duration')
     parser.add_argument('--high', type=int, default=99, help='UB of duration')
     parser.add_argument('--seed', type=int, default=200, help='Cap seed for validate set generation')
@@ -133,7 +137,6 @@ if __name__ == '__main__':
 
     path = './{}.pth'.format(str(N_JOBS_N) + '_' + str(N_MACHINES_N) + '_' + str(LOW) + '_' + str(HIGH))
     ppo.policy.load_state_dict(torch.load(path))
-
 
     SEEDs = range(0, params.seed, 10)
     result = []

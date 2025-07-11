@@ -38,7 +38,7 @@ def uni_instance_gen(n_j, n_m, low, high, device='cpu'):
 
     # Generate candidate and mask (simplified: first operation of each job)
     candidate = np.array([j * n_m for j in range(n_j)])  # First operation of each job
-    mask = np.zeros(n_j, dtype=bool)  # All candidates are valid initially
+    mask = np.ones(n_j, dtype=bool)  # 所有 candidate 初始皆可行  # All candidates are valid initially
 
     return edge_index, fea, candidate, mask
 
